@@ -1,14 +1,20 @@
 import argparse
 import csv
+import logging
 from typing import Optional
 
+import hydra
 import IPython
 import numpy
 import torch
+from omegaconf import OmegaConf
 from sklearn.metrics import v_measure_score
-from sparsemax import Sparsemax
 
+from latent_mapping import init_noises, latent_mappings
 from spigot.algorithms.krucker import project_onto_knapsack_constraint_batch
+from spigot.optim import GradientDescentOptimizer
+
+logger = logging.getLogger(__file__)
 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
@@ -29,104 +35,6 @@ def gumbel_noise_like(tensor: torch.FloatTensor) -> torch.FloatTensor:
     return gumbel_noise(shape=tensor.size(), device=tensor.device, dtype=tensor.dtype)
 
 
-class StraightThrough(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-
-        _, feature_size = x.size()
-        results = torch.nn.functional.one_hot(
-            torch.max(x, dim=-1).indices, num_classes=feature_size,
-        ).float()
-
-        return results
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return grad_output, None
-
-
-class StraightThroughSoftmax(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-
-        _, feature_size = x.size()
-        results = torch.nn.functional.one_hot(
-            torch.max(x, dim=-1).indices, num_classes=feature_size,
-        ).float()
-
-        ctx.save_for_backward(x)
-        return results
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (x,) = ctx.saved_tensors
-
-        with torch.enable_grad():
-            (grad,) = torch.autograd.grad(torch.softmax(x, dim=-1), x, grad_output)
-
-        return grad_output, None
-
-
-class SPIGOT(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-
-        _, feature_size = x.size()
-        results = torch.nn.functional.one_hot(
-            torch.max(x, dim=-1).indices, num_classes=feature_size,
-        ).float()
-
-        ctx.save_for_backward(results)
-        return results
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (predictions,) = ctx.saved_tensors
-
-        norm = torch.norm(grad_output, dim=-1)
-        scale = torch.ones_like(norm)
-        cond = norm > 1.0
-        scale[cond] = 1.0 / norm[cond]
-
-        target = - predictions + scale.unsqueeze(dim=-1) * grad_output
-
-        projected = project_onto_knapsack_constraint_batch(target)
-        # output = predictions - projected
-        output = projected - predictions
-        return output
-        output_scaled = norm.unsqueeze(dim=-1) * output / (torch.norm(output, dim=-1, keepdim=True) + 1e-12)
-        # return output_scaled
-        # return torch.max(output, torch.zeros_like(output_scaled))
-
-
-GAUSSIAN, UNIFORM = None, None
-
-
-def init_noises(K, device=None):
-    global GAUSSIAN, UNIFORM
-    GAUSSIAN = torch.randn((K, K), device=device)
-    UNIFORM = torch.rand((K, K), device=device)
-    print(GAUSSIAN.shape)
-
-
-class Noise(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x, noise):
-
-        _, feature_size = x.size()
-        results = torch.nn.functional.one_hot(
-            torch.max(x, dim=-1).indices, num_classes=feature_size,
-        ).float()
-
-        ctx.save_for_backward(noise)
-        return results
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (noise,) = ctx.saved_tensors
-        return torch.matmul(grad_output, noise), None
-
-
 def make_latent_triples(
     n_samples,
     n_features,
@@ -136,7 +44,7 @@ def make_latent_triples(
     b=None,
     data_std=0.1,
     cluster_std=1,
-    device=None
+    device=None,
 ):
     # generate cluster centers
     if centers is None:
@@ -175,17 +83,6 @@ def make_latent_triples(
     return to(X, y, z) + (centers, W, b)
 
 
-latent_mappings = {
-    "spigot": SPIGOT.apply,
-    # "sparsemax": Sparsemax(dim=-1),
-    # "softmax": torch.nn.Softmax(dim=-1),
-    # "ste": StraightThrough.apply,
-    # "sts": StraightThroughSoftmax.apply,
-    # "gaussian": lambda x: Noise.apply(x, GAUSSIAN),
-    # "uniform": lambda x: Noise.apply(x, UNIFORM),
-}
-
-
 class Net(torch.nn.Module):
     def __init__(self, K, dim_X, mapping_fun="softmax", gumbel=False):
         super().__init__()
@@ -194,36 +91,82 @@ class Net(torch.nn.Module):
         self.decoder = torch.nn.Bilinear(K, dim_X, 1)
         self.gumbel = gumbel
 
-    def forward(self, x):
+    def forward(self, x, y):
         s = self.encoder(x)
         if self.training and self.gumbel:
             s += gumbel_noise_like(s)
         z_hat = self.latent_mapping(s)
         z_hat_index = torch.argmax(z_hat, dim=-1)
         y_hat = self.decoder(z_hat, x).squeeze(dim=-1)
-        return y_hat, z_hat_index
+
+        loss = torch.nn.functional.mse_loss(y_hat, y)
+        accuracy = (torch.sign(y_hat) == y).float().mean()
+
+        return y_hat, z_hat_index, loss, accuracy
+
+
+class Net2(torch.nn.Module):
+    def __init__(self, K, dim_X, mapping_fun="softmax", gumbel=False):
+        super().__init__()
+        self.encoder = torch.nn.Linear(dim_X, K)
+        self.latent_mapping = latent_mappings[mapping_fun]
+        self.decoder = torch.nn.Bilinear(K, dim_X, 1)
+        self.gumbel = gumbel
+
+    def forward(self, x, y):
+        s = self.encoder(x)
+        if self.training and self.gumbel:
+            s += gumbel_noise_like(s)
+        z_hat = self.latent_mapping(s)
+        z_hat_index = torch.argmax(z_hat, dim=-1)
+
+        z_tilde = z_hat.clone().detach().requires_grad_(True)
+        y_hat = self.decoder(z_tilde, x).squeeze(dim=-1)
+        loss = torch.nn.functional.mse_loss(y_hat, y)
+
+        torch.autograd.backward(loss, create_graph=False)
+
+        norm = torch.norm(z_tilde.grad, dim=-1)
+        scale = torch.ones_like(norm)
+        scale[norm > 1.0] = 1.0 / norm[norm > 1.0]
+
+        z_tilde = project_onto_knapsack_constraint_batch(
+            -z_tilde + scale.unsqueeze(dim=-1) * z_tilde.grad
+        )
+
+        torch.autograd.backward(
+            s, -z_hat.clone().detach() + z_tilde, create_graph=False
+        )
+
+        accuracy = (torch.sign(y_hat) == y).float().mean()
+
+        return y_hat, z_hat_index, loss, accuracy
 
 
 def train(
-    net, train_xs, train_zs, train_ys, valid_xs, valid_zs, valid_ys,
+    net,
+    train_xs,
+    train_zs,
+    train_ys,
+    valid_xs,
+    valid_zs,
+    valid_ys,
+    lr=0.001,
+    epochs=10000,
 ):
 
-    optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
+    optimizer = torch.optim.Adam(net.parameters(), lr=lr)
 
     train_zs_cpu = train_zs.cpu()
     valid_zs_cpu = valid_zs.cpu()
 
-    for epoch in range(args.epochs):
+    for epoch in range(epochs):
 
         net.train()
 
-        predictions, z_hat = net(train_xs)
-
-        loss = torch.nn.functional.mse_loss(predictions, train_ys)
-
-        accuracy = (torch.sign(predictions) == torch.sign(train_ys)).float().mean()
-
         net.zero_grad()
+        _, z_hat, loss, accuracy = net(train_xs, train_ys)
+
         loss.backward()
 
         optimizer.step()
@@ -234,17 +177,15 @@ def train(
 
         net.eval()
         with torch.no_grad():
-            predictions, z_hat = net(valid_xs)
+            _, z_hat, loss, accuracy = net(valid_xs, valid_ys)
 
-        loss_valid = torch.nn.functional.mse_loss(predictions, valid_ys).cpu().item()
-        accuracy_valid = (
-            (torch.sign(predictions) == torch.sign(valid_ys)).float().mean().item()
-        )
+        loss_valid = loss.cpu().item()
+        accuracy_valid = accuracy.cpu().item()
 
         v_measure_valid = v_measure_score(valid_zs_cpu, z_hat.detach().cpu())
 
         if epoch % 100 == 0:
-            print(
+            logger.info(
                 f"epoch: {epoch} loss (train): {loss_train:.4f}, loss (dev): {loss_valid:.4f}, "
                 f"acc. (train): {accuracy_train:.4f}, acc. (valid): {accuracy_valid:.4f} "
                 f"v-mes. (train): {v_measure_train:.4f}, v-mes. (valid): {v_measure_valid:.4f}"
@@ -253,54 +194,66 @@ def train(
     return accuracy_valid, v_measure_valid
 
 
-if __name__ == "__main__":
+@hydra.main(config_name="config")
+def main(cfg):
+    logger.info(OmegaConf.to_yaml(cfg))
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--K", type=int, default=10)
-    parser.add_argument("--latent-dim", type=int, default=100)
-    parser.add_argument("--train-size", type=int, default=5000)
-    parser.add_argument("--valid-size", type=int, default=1000)
-    parser.add_argument("--epoch", type=int, default=10000)
+    device = torch.device("cpu" if cfg.device < 0 else f"cuda:{cfg.device}")
 
-    args = parser.parse_args()
-    device = torch.device("cpu" if args.device < 0 else f"cuda:{args.device}")
+    init_noises(cfg.K, device)
 
-    init_noises(args.K, device)
+    logger.info(f"latent dimension: {cfg.latent_dim}")
+    logger.info(f"dataset size train/valid: {cfg.train_size}/{cfg.valid_size}")
+    logger.info(f"epoch: {cfg.epochs}")
 
-    print("latent dimension", args.latent_dim)
-    print("dataset size train/valid", args.train_size, args.valid_size)
-    print("epoch", args.epochs)
-
-    with open("results_K10_spigot.csv", "w") as f:
+    with open("results.csv", "w") as f:
         writer = csv.writer(f)
 
-        for seed in range(10):
-            # seed += 40
+        for seed in range(cfg.seed, cfg.seed + 10):
 
             torch.manual_seed(seed)
             numpy.random.seed(seed)
 
             train_xs, train_ys, train_zs, centers, W, b = make_latent_triples(
-                args.train_size, args.latent_dim, args.K, device=device
+                cfg.train_size, cfg.latent_dim, cfg.K, device=device
             )
             valid_xs, valid_ys, valid_zs, *_ = make_latent_triples(
-                args.valid_size, args.latent_dim, args.K, centers=centers, W=W, b=b, device=device
+                cfg.valid_size,
+                cfg.latent_dim,
+                cfg.K,
+                centers=centers,
+                W=W,
+                b=b,
+                device=device,
             )
 
-            for j in range(5):
+            torch.manual_seed(seed)
+            numpy.random.seed(seed)
 
-                for latent_mapping in latent_mappings.keys():
-                    for gumbel in (True,):
-                        torch.manual_seed(seed + j + 40)
-                        numpy.random.seed(seed + j + 40)
+            net = Net(
+                K=cfg.K,
+                dim_X=cfg.latent_dim,
+                mapping_fun=cfg.latent_mapping,
+                gumbel=cfg.gumbel,
+            ).to(device)
 
-                        net = Net(K=args.K, dim_X=args.latent_dim, mapping_fun=latent_mapping, gumbel=gumbel).to(device)
+            logger.info(
+                f"seed: {seed}, latent mapping: {cfg.latent_mapping}, gumbel: {cfg.gumbel}"
+            )
+            accuracy, v_measure = train(
+                net,
+                train_xs,
+                train_zs,
+                train_ys,
+                valid_xs,
+                valid_zs,
+                valid_ys,
+                lr=cfg.lr,
+                epochs=cfg.epochs,
+            )
 
-                        with torch.autograd.set_detect_anomaly(False):
-                            print(seed, j, latent_mapping, gumbel)
-                            accuracy, v_measure = train(
-                                net, train_xs, train_zs, train_ys, valid_xs, valid_zs, valid_ys
-                            )
+            writer.writerow([seed, cfg.latent_mapping, cfg.gumbel, accuracy, v_measure])
 
-                        writer.writerow([seed, j, latent_mapping, gumbel, accuracy, v_measure])
+
+if __name__ == "__main__":
+    main()

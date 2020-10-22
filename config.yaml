@@ -1,0 +1,14 @@
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d_%H-%M-%S}/K:${K}-seed:${seed}-${latent_mapping}-gumbel:${gumbel}
+
+K: 10
+latent_mapping: "spigot"
+gumbel: true
+latent_dim: 100
+train_size: 5000
+valid_size: 1000
+epochs: 10000
+lr: 0.001
+device: 0
+seed: 0
