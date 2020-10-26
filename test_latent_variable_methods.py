@@ -45,10 +45,16 @@ def make_latent_triples(
     data_std=0.1,
     cluster_std=1,
     device=None,
+    uniform_center=False,
 ):
     # generate cluster centers
+    # if centers is None:
+    #     centers = cluster_std * torch.randn(n_clusters, n_features)
     if centers is None:
-        centers = cluster_std * torch.randn(n_clusters, n_features)
+        if uniform_center:
+            centers = cluster_std * (torch.rand(n_clusters, n_features) - 0.5)
+        else:
+            centers = cluster_std * torch.randn(n_clusters, n_features)
 
     # generate a linear model for each cluster
     if W is None:
@@ -112,6 +118,11 @@ class Net2(torch.nn.Module):
         self.latent_mapping = latent_mappings[mapping_fun]
         self.decoder = torch.nn.Bilinear(K, dim_X, 1)
         self.gumbel = gumbel
+        self.epoch = 0
+
+    def eval(self):
+        super().eval()
+        self.epoch += 1
 
     def forward(self, x, y):
         s = self.encoder(x)
@@ -130,13 +141,21 @@ class Net2(torch.nn.Module):
         scale = torch.ones_like(norm)
         scale[norm > 1.0] = 1.0 / norm[norm > 1.0]
 
-        z_tilde = project_onto_knapsack_constraint_batch(
-            -z_tilde + scale.unsqueeze(dim=-1) * z_tilde.grad
-        )
+        if False:  # self.epoch < 200:
+            mu = project_onto_knapsack_constraint_batch(
+                -z_tilde + scale.unsqueeze(dim=-1) * z_tilde.grad
+            )
+            torch.autograd.backward(s, -z_hat.clone().detach() + mu, create_graph=False)
+        else:
+            mu = project_onto_knapsack_constraint_batch(
+                z_tilde - scale.unsqueeze(dim=-1) * z_tilde.grad
+            )
 
-        torch.autograd.backward(
-            s, -z_hat.clone().detach() + z_tilde, create_graph=False
-        )
+            torch.autograd.backward(
+                s, (z_hat.clone().detach() - mu), create_graph=False
+            )
+        # if self.training and self.epoch % 100 == 0:
+        #     IPython.embed(colors="neutral")
 
         accuracy = (torch.sign(y_hat) == y).float().mean()
 
@@ -153,6 +172,7 @@ def train(
     valid_ys,
     lr=0.001,
     epochs=10000,
+    backward=True,
 ):
 
     optimizer = torch.optim.Adam(net.parameters(), lr=lr)
@@ -167,8 +187,8 @@ def train(
         net.zero_grad()
         _, z_hat, loss, accuracy = net(train_xs, train_ys)
 
-        loss.backward()
-
+        if backward:
+            loss.backward()
         optimizer.step()
 
         loss_train = loss.cpu().item()
@@ -176,15 +196,14 @@ def train(
         v_measure_train = v_measure_score(train_zs_cpu, z_hat.detach().cpu())
 
         net.eval()
-        with torch.no_grad():
-            _, z_hat, loss, accuracy = net(valid_xs, valid_ys)
+        _, z_hat, loss, accuracy = net(valid_xs, valid_ys)
 
         loss_valid = loss.cpu().item()
         accuracy_valid = accuracy.cpu().item()
 
         v_measure_valid = v_measure_score(valid_zs_cpu, z_hat.detach().cpu())
 
-        if epoch % 100 == 0:
+        if epoch % 1 == 0:
             logger.info(
                 f"epoch: {epoch} loss (train): {loss_train:.4f}, loss (dev): {loss_valid:.4f}, "
                 f"acc. (train): {accuracy_train:.4f}, acc. (valid): {accuracy_valid:.4f} "
