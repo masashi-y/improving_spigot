@@ -4,7 +4,7 @@ from sparsemax import Sparsemax
 from spigot.algorithms.krucker import project_onto_knapsack_constraint_batch
 
 
-def _argmax(x):
+def argmax_onehot(x):
     _, feature_size = x.size()
     return torch.nn.functional.one_hot(
         torch.max(x, dim=-1).indices, num_classes=feature_size,
@@ -14,7 +14,7 @@ def _argmax(x):
 class StraightThrough(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
-        return _argmax(x)
+        return argmax_onehot(x)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -25,7 +25,7 @@ class StraightThroughSoftmax(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
         ctx.save_for_backward(x)
-        return _argmax(x)
+        return argmax_onehot(x)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -42,7 +42,7 @@ class StraightThroughSoftmax(torch.autograd.Function):
 class SPIGOT(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
-        results = _argmax(x)
+        results = argmax_onehot(x)
         ctx.save_for_backward(results)
         return results
 
@@ -55,11 +55,12 @@ class SPIGOT(torch.autograd.Function):
         cond = norm > 1.0
         scale[cond] = 1.0 / norm[cond]
 
-        target = -predictions + scale.unsqueeze(dim=-1) * grad_output
+        target = predictions - scale.unsqueeze(dim=-1) * grad_output
 
-        projected = project_onto_knapsack_constraint_batch(target)
-        # output = predictions - projected
-        output = projected - predictions
+        projected = Sparsemax(dim=-1)(target)
+        # projected = project_onto_knapsack_constraint_batch(target)
+        output = predictions - projected
+        # output = projected - predictions
         return output
         # output_scaled = (
         #     norm.unsqueeze(dim=-1)
@@ -84,7 +85,7 @@ class Noise(torch.autograd.Function):
     def forward(ctx, x, noise):
         assert noise is not None
         ctx.save_for_backward(noise)
-        return _argmax(x)
+        return argmax_onehot(x)
 
     @staticmethod
     def backward(ctx, grad_output):

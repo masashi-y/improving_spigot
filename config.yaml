@@ -4,11 +4,16 @@ hydra:
 
 K: 10
 latent_mapping: "spigot"
+diagnostic: false
 gumbel: true
 latent_dim: 100
+num_layers: 1
 train_size: 5000
 valid_size: 1000
 epochs: 10000
+oracle_decoder: false
 lr: 0.001
+clip_grad: null
+report_epoch: 100
 device: 0
 seed: 0
